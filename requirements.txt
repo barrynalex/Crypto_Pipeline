@@ -2,5 +2,4 @@ requests
 pandas
 google-cloud-storage
 google-cloud-bigquery
-apache-airflow==2.8.1
 python-dotenv

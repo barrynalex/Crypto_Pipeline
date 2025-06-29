@@ -1,70 +1,107 @@
-version: '3.8'
-
-x-airflow-common:
-  &airflow-common
+x-airflow-common: &airflow-common
   build:
     context: .
     dockerfile: Dockerfile
   env_file: .env
   environment:
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+    # metadata DB
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: >-
+      postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+
+    # Celery
+    AIRFLOW__CELERY__RESULT_BACKEND: >-
+      db+postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+
     AIRFLOW__WEBSERVER__WEB_SERVER_PORT: 8080
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./src:/opt/airflow/src
+    - ./keys:/opt/airflow/keys:ro
   depends_on:
-    - postgres
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
 
 services:
   postgres:
     image: postgres:13
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
 
-  airflow-init:
-    <<: *airflow-common
-    command: >
-      bash -c "
-        airflow db init &&
-        airflow users create \
-          --username admin \
-          --password admin \
-          --firstname Airflow \
-          --lastname Admin \
-          --role Admin \
-          --email admin@example.com
-      "
-    depends_on:
-      - postgres
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
 
   airflow-webserver:
     <<: *airflow-common
-    command: webserver
+    # migrate/init DB and create user, then start webserver
+    command: [
+      "bash",
+      "-c",
+      "airflow db upgrade &&
+        airflow users create --username ${AIRFLOW__ADMIN_USER:-admin} --password ${AIRFLOW__ADMIN_PASSWORD:-admin} --firstname Airflow --lastname Admin --role Admin --email admin@example.com &&
+        exec airflow webserver"
+    ]
     ports:
       - "8080:8080"
-    depends_on:
-      - airflow-init
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
     depends_on:
-      - airflow-init
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   airflow-worker:
     <<: *airflow-common
-    command: celery
+    command: celery worker
     depends_on:
-      - airflow-init
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type CeleryWorkerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
   metabase:
     image: metabase/metabase:latest
@@ -74,6 +111,13 @@ services:
       MB_DB_FILE: /metabase-data/metabase.db
     volumes:
       - metabase-data:/metabase-data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
 
 volumes:
   postgres-db-volume:
